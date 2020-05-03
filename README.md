@@ -1,0 +1,2 @@
+# DigitalEquatorial
+for star photography
