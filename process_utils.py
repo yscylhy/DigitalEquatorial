@@ -5,6 +5,241 @@ from skimage.feature import peak_local_max
 from scipy import ndimage
 import heapq
 
+
+def low_pass_filter(img, h_thresh, w_tresh):
+    def _low_pass_filter(img):
+        h, w = img.shape
+        img_fft = np.fft.fft2(img)
+        for di in range(-h_thresh, h_thresh+1):
+            for dj in range(-w_tresh, w_tresh+1):
+                i = (di+h)%h
+                j = (dj+w)%w
+                img_fft[i, j] = 0
+        img = np.real(np.fft.ifft2(img_fft))
+        return img
+
+    if len(img.shape)>2:
+        _, _, c = img.shape
+        for c_idx in range(c):
+            img[:,:,c_idx] = _low_pass_filter(img[:,:,c_idx])
+    else:
+        img = _low_pass_filter(img)
+
+    return img
+
+
+class Overlayer:
+    def __init__(self, src_img, tar_img, row_fit_param, col_fit_param, src_weight):
+        self.src_img = src_img
+        self.tar_img = tar_img
+        self.row_fit_param = row_fit_param
+        self.col_fit_param = col_fit_param
+        self.src_weight = src_weight
+        if len(src_img)>2:
+            self.h, self.w, self.c = src_img.shape
+        else:
+            self.h, self.w = src_img.shape
+            self.c = None
+
+    def overlay(self):
+        t_src_img = self.dense_translate()
+        overlayed_img = t_src_img*self.src_weight + self.tar_img*(1-self.src_weight)
+        return overlayed_img
+
+    def dense_translate(self):
+        row_distortion_field = self.get_distortion(self.row_fit_param)
+        col_distortion_field = self.get_distortion(self.col_fit_param)
+        x = np.arange(0, self.w, 1)
+        y = np.arange(0, self.h, 1)
+        u, v = np.meshgrid(x, y)
+        org_idx = np.vstack([v.flatten(), u.flatten()]).transpose()
+        new_idx = np.array([org_idx[:, 0] + row_distortion_field, org_idx[:, 1] + col_distortion_field]).astype(np.int)
+        new_idx[0, :] = np.maximum(new_idx[0, :], 0)
+        new_idx[0, :] = np.minimum(new_idx[0, :], self.h-1)
+        new_idx[1, :] = np.maximum(new_idx[1, :], 0)
+        new_idx[1, :] = np.minimum(new_idx[1, :], self.w-1)
+
+        if self.c is not None:
+            src_canvas = np.zeros([self.h, self.w, self.c])
+            for c_idx in range(self.c):
+                temp = self.src_img[:, :, c_idx]
+                src_canvas[:, :, c_idx] = temp[new_idx[0, :], new_idx[1, :]].reshape([self.h, self.w])
+        else:
+            src_canvas = self.src_img[new_idx[0, :], new_idx[1, :]]
+            src_canvas.reshape([self.h, self.w])
+
+        return src_canvas
+
+    def get_distortion(self, fit_param):
+        if len(self.src_img) > 2:
+            h, w, c = self.src_img.shape
+        else:
+            h, w = self.src_img.shape
+        x = np.arange(0, w, 1)
+        y = np.arange(0, h, 1)
+        u, v = np.meshgrid(x, y)
+        u = u.flatten()
+        v = v.flatten()
+        org_idx = np.vstack([v*v, u*u, v*u, v, u, np.ones(u.shape[0])])
+        delta_idx = np.dot(fit_param, org_idx)
+        return delta_idx
+
+
+def plot_arrow_map(data, colors=None):
+    h, w, _ = data.shape
+    x = np.arange(0, w, 1)
+    y = np.arange(0, h, 1)
+    fig, ax = plt.subplots()
+    if colors is not None:
+        colors = colors.reshape(data.shape[0], data.shape[1])
+        colors = 1-colors.astype(np.float)
+        q = ax.quiver(x, y, data[:, :, 1], -data[:, :, 0], colors)
+    else:
+        q = ax.quiver(x, y, data[:, :, 1], -data[:, :, 0])
+    ax.invert_yaxis()
+    ax.quiverkey(q, X=0.3, Y=1.1, U=10,
+                 label='Quiver key, length = 10', labelpos='E')
+
+    plt.show()
+
+
+def translate(img, t):
+    delta_row, delta_col = t
+    translated_img = np.zeros(img.shape)
+    if len(img.shape) == 3:
+        h, w, _ = img.shape
+        is_color = True
+    else:
+        h, w = img.shape
+        is_color = False
+
+    overlap_h = h - abs(delta_row)
+    overlap_w = w - abs(delta_col)
+    t_start_row = 0 if delta_row < 0 else delta_row
+    t_start_col = 0 if delta_col < 0 else delta_col
+    i_start_row = 0 if delta_row > 0 else -delta_row
+    i_start_col = 0 if delta_col > 0 else -delta_col
+    if is_color:
+        translated_img[t_start_row:t_start_row+overlap_h, t_start_col:t_start_col+overlap_w, :] = \
+            img[i_start_row:i_start_row+overlap_h, i_start_col:i_start_col+overlap_w, :]
+    else:
+        translated_img[t_start_row:t_start_row + overlap_h, t_start_col:t_start_col + overlap_w, :] = \
+            img[i_start_row:i_start_row + overlap_h, i_start_col:i_start_col + overlap_w, :]
+
+    return translated_img
+
+
+def normalize(np_data):
+    max_val = np.max(np_data.flatten())
+    min_val = np.min(np_data.flatten())
+    return (np_data - min_val)/(max_val-min_val)*255
+
+
+def fft_register(img1, img2):
+    if len(img1.shape) == 3:
+        img1 = img1[:, :, 1]
+        img2 = img2[:, :, 1]
+    h, w = img1.shape
+    idx = np.argmax(np.fft.ifft2(np.fft.fft2(img1)*np.conjugate(np.fft.fft2(img2))))
+    row_idx, col_idx = np.unravel_index(idx, img1.shape)
+    if row_idx > h//2:
+        row_idx -= h
+    if col_idx > w//2:
+        col_idx -= w
+    return [row_idx, col_idx]
+
+
+def feature_register(img1, img2):
+    if len(img1.shape) == 3:
+        img1 = img1[:, :, 1].astype('uint8')
+        img2 = img2[:, :, 1].astype('uint8')
+
+    # -- Create ORB detector with 5000 features.
+    orb_detector = cv2.ORB_create(5000)
+
+    # -- Find keypoints and descriptors.
+    kp1, d1 = orb_detector.detectAndCompute(img1, mask=None)
+    kp2, d2 = orb_detector.detectAndCompute(img2, mask=None)
+
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = matcher.match(d1, d2)
+    matches.sort(key=lambda x: x.distance)
+
+    # -- Take the top 90 % matches forward.
+    matches = matches[:int(len(matches) * 10)]
+    no_of_matches = len(matches)
+
+    # -- Define empty matrices of shape no_of_matches * 2.
+    p1 = np.zeros((no_of_matches, 2))
+    p2 = np.zeros((no_of_matches, 2))
+
+    for i in range(len(matches)):
+        p1[i, :] = kp1[matches[i].queryIdx].pt
+        p2[i, :] = kp2[matches[i].trainIdx].pt
+
+        # -- Find the homography matrix.
+    homography, mask = cv2.findHomography(p1, p2, cv2.RANSAC)
+    return homography
+
+
+def feature_translate(img, t):
+    if len(img.shape) == 3:
+        h, w, _ = img.shape
+        is_color = True
+    else:
+        h, w = img.shape
+        is_color = False
+    transformed_img = cv2.warpPerspective(img, t, (w, h))
+    return transformed_img
+
+
+def margin_register(src_patch, tar_patch):
+    src_h, src_w = src_patch.shape
+    tar_h, tar_w = tar_patch.shape
+    assert tar_h >= src_h and tar_w >= src_w, "target patch should be larger than the source patch!"
+    src_patch = src_patch - np.mean(src_patch)
+    tar_patch = tar_patch - np.mean(tar_patch)
+
+    src_canvas = np.zeros([tar_h, tar_w])
+    src_canvas[:src_h, :src_w] = src_patch
+
+    idx = np.argmax(np.fft.ifft2(np.fft.fft2(tar_patch) * np.conjugate(np.fft.fft2(src_canvas))))
+    row_idx, col_idx = np.unravel_index(idx, tar_patch.shape)
+    if row_idx > tar_h // 2:
+        row_idx -= tar_h
+    if col_idx > tar_w // 2:
+        col_idx -= tar_w
+
+    return [row_idx, col_idx]
+
+
+def patch_register(src_img, tar_img, patch_size=100, margin=100, step=50):
+    if len(src_img.shape) == 3:
+        src_img = src_img[:, :, 1].astype('uint8')
+        tar_img = tar_img[:, :, 1].astype('uint8')
+
+    h, w = src_img.shape
+    arrow_map = []
+    h_pos_map = []
+    w_pos_map = []
+    for s_h in range(margin, h-margin-patch_size, step):
+        arrow_map.append([])
+        h_pos_map.append([])
+        w_pos_map.append([])
+
+        for s_w in range(margin, w-margin-patch_size, step):
+            src_patch = src_img[s_h:s_h+patch_size, s_w:s_w+patch_size]
+            tar_patch = tar_img[s_h-margin:s_h+patch_size+margin, s_w-margin:s_w+patch_size+margin]
+            shift_vector = margin_register(src_patch, tar_patch)
+            arrow_map[-1].append([x-margin for x in shift_vector])
+            h_pos_map[-1].append(s_h + patch_size//2)
+            w_pos_map[-1].append(s_w + patch_size//2)
+    arrow_map = np.array(arrow_map)
+    h_pos_map = np.array(h_pos_map)
+    w_pos_map = np.array(w_pos_map)
+    return arrow_map, h_pos_map, w_pos_map
+
+
 # -- find the linear movement of the star (0.25 degree per minute. 15 degree per hour.)
 class LineFinder:
     @classmethod
@@ -172,6 +407,39 @@ class PolarisFinder:
         canvas[:, :, 1] = ndimage.morphology.binary_dilation(canvas[:, :, 1], iterations=3)
         canvas = canvas*255
         return canvas
+
+
+class Purifier:
+    @classmethod
+    def enhancement(cls, img_stack):
+        std_map = np.std(img_stack, axis=0)
+        min_map = np.min(img_stack, axis=0)
+        max_map = np.max(img_stack, axis=0)
+        img1 = img_stack[0]
+        plt.figure()
+        plt.imshow(np.log((img1 - min_map)+256))
+        plt.show()
+
+
+class PatchRegistration:
+    @classmethod
+    def patch_register(cls, img1, img2, patch_size, step_size=None):
+        if step_size is None:
+            step_size = patch_size
+        H, W = img1.shape
+        shift_map = []
+        for i in range(0, H-patch_size, step_size):
+            for j in range(0, W-patch_size, step_size):
+                patch_1 = img1[i:i+patch_size, j:j+patch_size]
+                patch_2 = img2[j:j+patch_size, j:j+patch_size]
+                cross_corr = np.fft.ifft2(np.fft.fft2(patch_1)*np.conj(np.fft.fft2(patch_2)))
+                max_idx = np.argmax(cross_corr)
+                idx_i, idx_j = np.unravel_index(max_idx, [patch_size, patch_size])
+                shift_map.append([idx_i, idx_j])
+
+        return shift_map
+
+
 
 
 
