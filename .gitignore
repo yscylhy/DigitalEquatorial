@@ -1,4 +1,5 @@
 # resources folder
+./*.png
 DCIM/
 .idea/
 *.txt
